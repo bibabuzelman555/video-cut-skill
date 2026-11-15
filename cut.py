@@ -1,12 +1,13 @@
 # /// script
 # requires-python = ">=3.10,<3.13"
-# dependencies = ["faster-whisper", "imageio-ffmpeg"]
+# dependencies = ["faster-whisper", "imageio-ffmpeg", "librosa"]
 # ///
 """Talking-Head-Cutter: Pausen raus, inhaltlich kürzen, Zooms, 9:16, Wort-Untertitel.
 
     uv run cut.py video.mp4                       -> video_cut.mp4 + video_cut.words.tsv
     uv run cut.py video.mp4 --drop "12.3-15.8,40-44"   Stellen rausschneiden (Sekunden im Original)
     uv run cut.py video.mp4 --words video_cut.words.tsv   korrigierte Wörter nutzen statt neu zu transkribieren
+    uv run cut.py video.mp4 --title "0-3=5 Tage Zeit" --flash "12.3,40" --music beat.mp3
     Abschalten: --no-subs  --no-zoom  --no-vertical
 """
 import argparse
@@ -95,11 +96,32 @@ def read_words(path):
     return [(float(a), float(b), w.strip()) for a, b, w in rows]
 
 
-def write_ass(words, path, vertical):
-    """Je 3 Wörter (oder bis Satzende) pro Einblendung, das gerade gesprochene Wort gelb."""
+def snap(t, beats, tol=0.35):
+    """Zeit auf den nächsten Beat ziehen, wenn einer nah genug liegt."""
+    near = min(beats, key=lambda b: abs(b - t), default=t)
+    return near if abs(near - t) <= tol else t
+
+
+assert snap(1.2, [1.0, 2.0]) == 1.0 and snap(1.5, [1.0, 2.0]) == 1.5 and snap(1, []) == 1
+
+
+def detect_beats(ff, music, total):
+    """Tempo und Beat-Zeiten der Musik über die Länge des fertigen Videos (Musik läuft in Schleife)."""
+    import librosa
+    import numpy as np
+
+    pcm = subprocess.run([ff, "-v", "error", "-stream_loop", "-1", "-i", music, "-t", f"{total:.2f}",
+                          "-f", "f32le", "-ac", "1", "-ar", "22050", "-"], capture_output=True, check=True).stdout
+    tempo, frames = librosa.beat.beat_track(y=np.frombuffer(pcm, np.float32), sr=22050)
+    return float(np.atleast_1d(tempo)[0]), [float(t) for t in librosa.frames_to_time(frames, sr=22050)]
+
+
+def write_ass(words, titles, path, vertical):
+    """Untertitel: je 3 Wörter (oder bis Satzende), das gesprochene Wort gelb. Titel: gelbe Karte oben, poppt auf."""
     # shortcut: ohne --no-vertical wird 1080x1920 angenommen, sonst 1920x1080;
     # bei anderen Formaten skaliert libass, die Schrift wirkt dann etwas größer/kleiner.
     w, h, size, margin = (1080, 1920, 84, 400) if vertical else (1920, 1080, 60, 80)
+    t_size, t_margin = (92, 260) if vertical else (70, 60)
 
     def ts(t):
         cs = round(t * 100)
@@ -118,7 +140,9 @@ def write_ass(words, path, vertical):
              "[V4+ Styles]",
              "Format: Name, Fontname, Fontsize, PrimaryColour, OutlineColour, BackColour, Bold, BorderStyle, "
              "Outline, Shadow, Alignment, MarginL, MarginR, MarginV",
-             f"Style: Default,Arial,{size},&H00FFFFFF,&H00000000,&H00000000,1,1,6,0,2,60,60,{margin}", "",
+             f"Style: Default,Arial,{size},&H00FFFFFF,&H00000000,&H00000000,1,1,6,0,2,60,60,{margin}",
+             # BorderStyle 3 = Kasten in der Outline-Farbe (gelb), Schrift schwarz, oben mittig
+             f"Style: Title,Arial,{t_size},&H00000000,&H0000E5FF,&H00000000,1,3,14,0,8,60,60,{t_margin}", "",
              "[Events]", "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text"]
     for chunk in chunks:
         for i, (start, end, _) in enumerate(chunk):
@@ -128,6 +152,9 @@ def write_ass(words, path, vertical):
             text = " ".join(f"{{\\c&H00FFFF&}}{t}{{\\c&HFFFFFF&}}" if j == i else t
                             for j, (_, _, t) in enumerate(chunk))
             lines.append(f"Dialogue: 0,{ts(start)},{ts(stop)},Default,,0,0,0,,{text}")
+    for start, end, text in titles:
+        pop = "{\\fad(100,200)\\fscx70\\fscy70\\t(0,160,\\fscx100\\fscy100)}"
+        lines.append(f"Dialogue: 1,{ts(start)},{ts(end)},Title,,0,0,0,,{pop}{text}")
     Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -141,6 +168,11 @@ def main():
     p.add_argument("-o", "--out")
     p.add_argument("--drop", default="", help='Stellen rausschneiden, Sekunden im Original: "12.3-15.8,40-44"')
     p.add_argument("--words", help="korrigierte .words.tsv nutzen statt neu zu transkribieren")
+    p.add_argument("--title", action="append", default=[],
+                   help='Einblendung oben, Sekunden im Original: "0-3=Text" (mehrfach möglich)')
+    p.add_argument("--flash", default="", help='Blitz-Übergang an Themenwechseln, Sekunden im Original: "12.3,40"')
+    p.add_argument("--music", help="Musikdatei: läuft leise unter der Stimme, Zooms und Blitze rasten auf den Beat ein")
+    p.add_argument("--music-volume", type=float, default=0.2, help="Lautstärke der Musik (Standard 0.2)")
     p.add_argument("--no-subs", action="store_true")
     p.add_argument("--no-zoom", action="store_true")
     p.add_argument("--no-vertical", action="store_true")
@@ -160,6 +192,18 @@ def main():
         assert all(len(d) == 2 and d[0] < d[1] for d in drops)
     except (ValueError, AssertionError):
         sys.exit('--drop braucht die Form "12.3-15.8,40-44" (Start kleiner als Ende).')
+    try:
+        titles = []
+        for item in a.title:
+            times, text = item.split("=", 1)
+            start, end = (float(x) for x in times.split("-"))
+            titles.append((start, end, text.strip()))
+        flashes = [float(x) for x in a.flash.split(",") if x.strip()]
+    except ValueError:
+        sys.exit('--title braucht die Form "0-3=Text", --flash die Form "12.3,40".')
+    music = Path(a.music).resolve() if a.music else None
+    if music and not music.is_file():
+        sys.exit(f"Musikdatei nicht gefunden: {music}")
 
     import imageio_ffmpeg
     ff = imageio_ffmpeg.get_ffmpeg_exe()
@@ -185,13 +229,21 @@ def main():
     kept_words = [(remap(s, keep), remap(e, keep), w) for s, e, w in words
                   if any(x <= (s + e) / 2 < b for x, b in keep)]
 
+    beats = []
+    if music:
+        bpm, beats = detect_beats(ff, str(music), total)
+        print(f"Musik: {bpm:.0f} BPM, {len(beats)} Beats")
+    kept_titles = [(s, e, t) for s, e, t in ((remap(s, keep), remap(e, keep), t) for s, e, t in titles) if e > s]
+    flash_times = [snap(remap(t, keep), beats) for t in flashes]
+
     select = spans_expr(keep)
     graph = f"[0:v]select='{select}',setpts=N/FRAME_RATE/TB"
     if not a.no_vertical:
         graph += ",crop='min(iw,ih*9/16)':'min(ih,iw*16/9)',scale=1080:1920"
     if not a.no_zoom:
         cuts = [remap(b, keep) for _, b in keep[:-1]]
-        sentence_ends = [e for _, e, w in kept_words if w[-1:] in ".!?"]
+        # Schnitte bleiben exakt; nur die Zoom-Wechsel an Satzenden rasten auf den Beat ein
+        sentence_ends = [snap(e, beats) for _, e, w in kept_words if w[-1:] in ".!?"]
         zooms = zoom_spans(cuts + sentence_ends, total)
         if zooms:
             print("Zooms: " + ", ".join(f"{x:.1f}-{b:.1f}" for x, b in zooms))
@@ -199,15 +251,32 @@ def main():
             graph += (f",split[base][big];[big]scale=iw*{ZOOM}:ih*{ZOOM}[zoomed];"
                       f"[base][zoomed]overlay=(W-w)/2:(H-h)*0.4:enable='{spans_expr(zooms)}'")
 
+    if flash_times:
+        print("Blitze: " + ", ".join(f"{t:.1f}" for t in flash_times))
+        # kurzer heller Blitz (0,24 s) als Übergang: Helligkeit steigt zum Zeitpunkt und fällt wieder
+        bright = "+".join(f"0.5*max(0,1-abs(t-{t:.3f})/0.12)" for t in flash_times)
+        graph += f",eq=brightness='min(1,{bright})':eval=frame"
+
+    fade = f"fade=t=out:st={max(total - 0.4, 0):.3f}:d=0.4"  # weiches Ende statt hartem Abbruch
     with tempfile.TemporaryDirectory() as tmp:
-        if not a.no_subs and kept_words:
-            write_ass(kept_words, Path(tmp) / "subs.ass", not a.no_vertical)
+        sub_words = [] if a.no_subs else kept_words
+        if sub_words or kept_titles:
+            write_ass(sub_words, kept_titles, Path(tmp) / "subs.ass", not a.no_vertical)
             graph += ",subtitles=subs.ass"  # cwd=tmp: so braucht der Filter keinen escapten Windows-Pfad
-        graph += f"[v];[0:a]aselect='{select}',asetpts=N/SR/TB[au]"
+        graph += f",{fade}[v];[0:a]aselect='{select}',asetpts=N/SR/TB"
+        inputs = ["-i", str(src)]
+        if music:
+            inputs += ["-stream_loop", "-1", "-i", str(music)]
+            # Musik wird leiser, sobald gesprochen wird (Stimme steuert den Kompressor)
+            graph += (f",asplit[voice][key];[1:a]volume={a.music_volume}[m];"
+                      "[m][key]sidechaincompress=threshold=0.05:ratio=3:attack=20:release=400[duck];"
+                      "[voice][duck]amix=inputs=2:duration=first:normalize=0")
+        graph += f",a{fade}[au]"
         # shortcut: alle Schnitte stehen in einem Filterausdruck (Windows-Limit ~1000 Schnitte),
         # für stundenlange Videos auf eine Filter-Datei umstellen.
-        run([ff, "-y", "-hide_banner", "-i", str(src), "-filter_complex", graph, "-map", "[v]", "-map", "[au]",
-             "-c:v", "libx264", "-crf", "20", "-preset", "fast", "-c:a", "aac", str(out)], cwd=tmp)
+        run([ff, "-y", "-hide_banner", *inputs, "-filter_complex", graph, "-map", "[v]", "-map", "[au]",
+             "-t", f"{total:.3f}", "-c:v", "libx264", "-crf", "20", "-preset", "fast", "-c:a", "aac", str(out)],
+            cwd=tmp)
     print(f"Fertig: {out}")
 
 
